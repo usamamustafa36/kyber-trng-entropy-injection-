@@ -1,0 +1,4 @@
+kyber-py>=1.0
+pyserial>=3.5
+scipy>=1.10
+pytest>=7.0

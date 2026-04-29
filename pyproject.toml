@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kyber-trng-entropy-injection"
+version = "0.1.0"
+description = "Hardware-entropy-injected ML-KEM (Kyber) — replaces AES-CTR_DRBG with a SAM3X8E ring-oscillator TRNG, with hybrid TRNG ⊕ DRBG defense in depth and SP 800-90B health monitoring."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Usama Mustafa" }]
+requires-python = ">=3.9"
+dependencies = [
+    "kyber-py>=1.0",
+    "pyserial>=3.5",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["python"]
