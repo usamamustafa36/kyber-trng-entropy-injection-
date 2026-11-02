@@ -1,73 +1,68 @@
-"""
-Unit tests for SP 800-90B health monitors and the hybrid DRBG.
-
-Run: python -m pytest tests/
-"""
+"""Tests for SP 800-90B health monitor (RCT + APT)."""
 
 import os
+
 import pytest
 
-from kyber_trng.health import HealthMonitor, RepetitionCountTest, AdaptiveProportionTest
-from kyber_trng.source import SimulatedTRNGSource
-from kyber_trng.hybrid import HybridDRBG
-from kyber_trng.validation import StatisticalSuite
+from kyber_trng.health import (
+    HealthMonitor, RepetitionCountTest, AdaptiveProportionTest,
+    rct_cutoff, apt_cutoff,
+)
 
 
-def test_rct_passes_random():
-    rct = RepetitionCountTest(h_min=0.5)
-    for b in os.urandom(10_000):
-        assert rct.update(b)
+def test_rct_cutoff_matches_thesis():
+    # Thesis / paper §6: H=0.5, α=2⁻²⁰ → C_RCT=41.
+    assert rct_cutoff(0.5, 2 ** -20) == 41
 
 
-def test_rct_flags_stuck_output():
-    rct = RepetitionCountTest(h_min=0.5)
-    failed = False
-    for _ in range(rct.cutoff + 5):
-        if not rct.update(0xAA):
-            failed = True
-            break
-    assert failed, "RCT did not flag a stuck output"
+def test_rct_trips_on_constant_stream():
+    rct = RepetitionCountTest(h_min=0.5, alpha=2 ** -20)
+    for _ in range(rct.cutoff):
+        rct.update(0)
+    assert rct.failed
 
 
-def test_apt_passes_random():
-    apt = AdaptiveProportionTest(window=512, h_min=0.5)
-    for b in os.urandom(10_000):
-        assert apt.update(b)
+def test_rct_does_not_trip_on_alternating():
+    rct = RepetitionCountTest(h_min=0.5, alpha=2 ** -20)
+    for i in range(10000):
+        rct.update(i & 1)
+    assert not rct.failed
 
 
-def test_health_monitor_combined():
-    hm = HealthMonitor()
-    assert hm.feed(os.urandom(8192))
-    r = hm.report()
-    assert r.healthy
-    assert r.bytes_seen == 8192
-    assert r.rct_failures == 0
-    assert r.apt_failures == 0
+def test_apt_cutoff_for_h_one():
+    # H=1 → p=0.5 → expected count W/2.  Cutoff should be > W/2.
+    c = apt_cutoff(1.0, 2 ** -20, 512)
+    assert c > 256
+    assert c <= 512
 
 
-def test_hybrid_drbg_outputs_correct_length():
-    src = SimulatedTRNGSource()
-    drbg = HybridDRBG(src, reseed_interval=4096)
-    for n in (16, 32, 64, 1024, 4097):  # crosses reseed boundary
-        out = drbg.read(n)
-        assert len(out) == n
+def test_apt_trips_on_biased_stream():
+    apt = AdaptiveProportionTest(h_min=0.5, alpha=2 ** -20, window=512)
+    # Stream that's overwhelmingly 0x42.
+    for _ in range(apt.window * 2):
+        apt.update(0x42)
+    assert apt.failed
 
 
-def test_hybrid_drbg_not_repeating():
-    drbg = HybridDRBG(SimulatedTRNGSource())
-    samples = [drbg.read(32) for _ in range(20)]
-    assert len(set(samples)) == 20
+def test_health_monitor_passes_on_random_stream():
+    h = HealthMonitor()
+    # 4 KiB of OS-level randomness.  Should never trip the cutoffs.
+    h.update(os.urandom(4096))
+    assert h.report().ok
 
 
-def test_statistical_suite_random():
-    """OS entropy must pass the in-Python NIST subset."""
-    data = os.urandom(64 * 1024)
-    report = StatisticalSuite().run_all(data)
-    assert report.passed, f"OS entropy failed validation:\n{report}"
+def test_health_monitor_fails_closed():
+    h = HealthMonitor()
+    h.update(b"\x00" * 100)
+    assert h.failed
+    # Once failed, further "good" data does not recover.
+    h.update(os.urandom(1024))
+    assert h.failed
 
 
-def test_statistical_suite_flags_constant():
-    """All-zero stream MUST fail."""
-    data = b"\x00" * (16 * 1024)
-    report = StatisticalSuite().run_all(data)
-    assert not report.passed
+def test_apt_constant_byte_within_window_bounds():
+    """An all-zero stream should fail APT once the window is full."""
+    apt = AdaptiveProportionTest(h_min=0.5, alpha=2 ** -20, window=512)
+    for _ in range(apt.window):
+        apt.update(0)
+    assert apt.failed

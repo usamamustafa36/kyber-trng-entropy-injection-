@@ -1,95 +1,127 @@
-"""
-Hybrid TRNG ⊕ DRBG entropy mode.
+"""HMAC-SHA256 DRBG and the hybrid TRNG ⊕ DRBG construction.
 
-Improvement over the baseline thesis design: instead of replacing AES-CTR_DRBG
-*entirely* with the TRNG (which trades one single point of failure for
-another), this module XORs the TRNG output with HKDF-DRBG output reseeded
-from the TRNG. Properties:
+The DRBG follows NIST SP 800-90A §10.1.2 (HMAC_DRBG, SHA-256).  State is
+``(K, V)`` with ``K`` the HMAC key and ``V`` the rolling value; both are
+32 bytes.  ``Update`` and ``Generate`` follow the spec verbatim apart
+from minor naming changes.
 
-  * If the TRNG fails (stuck output, low entropy): DRBG output preserves
-    cryptographic strength as long as the TRNG seed at boot was good.
-  * If the DRBG seed is leaked / state is captured: live TRNG injection means
-    output remains unpredictable.
-  * Both must be compromised simultaneously for the entropy stream to fail.
+The :class:`HybridDRBG` wraps any :class:`TRNGSource` and an
+``HMAC_DRBG`` instance.  On every ``read(n)`` it XORs ``DRBG.generate(n)``
+with ``TRNG.read(n)``.  This delivers entropy *defense in depth*:
 
-This is "defense in depth" applied to entropy — analogous to TLS hybrid
-key exchange combining classical + post-quantum KEMs.
+* compromise of the DRBG state alone yields a stream still XORed with
+  live TRNG output;
+* compromise of the TRNG alone yields a stream still XORed with DRBG
+  output seeded from earlier (uncompromised) TRNG bytes.
+
+The DRBG is reseeded every :pyattr:`reseed_interval_bytes` of generated
+output (default 1 MiB) using fresh TRNG bytes.
 """
 
 from __future__ import annotations
 
-import hashlib
 import hmac
+import hashlib
 from typing import Optional
 
 from .source import TRNGSource
-from .health import HealthMonitor
 
 
-class HybridDRBG:
+class HMAC_DRBG:
+    """HMAC-SHA256 DRBG, NIST SP 800-90A §10.1.2."""
+
+    OUTLEN = 32  # bytes
+    MAX_BYTES_PER_REQUEST = 7500  # SP 800-90A Table 2 caps at 2^19 bits
+
+    def __init__(self, seed: bytes, personalization: bytes = b""):
+        if len(seed) < 32:
+            raise ValueError("HMAC_DRBG seed must be ≥ 32 bytes")
+        self.K = b"\x00" * self.OUTLEN
+        self.V = b"\x01" * self.OUTLEN
+        self._update(seed + personalization)
+        self.reseed_counter = 1
+
+    def _hmac(self, data: bytes) -> bytes:
+        return hmac.new(self.K, data, hashlib.sha256).digest()
+
+    def _update(self, provided_data: bytes = b"") -> None:
+        self.K = hmac.new(self.K, self.V + b"\x00" + provided_data,
+                          hashlib.sha256).digest()
+        self.V = self._hmac(self.V)
+        if provided_data:
+            self.K = hmac.new(self.K, self.V + b"\x01" + provided_data,
+                              hashlib.sha256).digest()
+            self.V = self._hmac(self.V)
+
+    def reseed(self, entropy: bytes, additional: bytes = b"") -> None:
+        if len(entropy) < 32:
+            raise ValueError("reseed entropy must be ≥ 32 bytes")
+        self._update(entropy + additional)
+        self.reseed_counter = 1
+
+    def generate(self, n: int, additional: bytes = b"") -> bytes:
+        if n < 0:
+            raise ValueError("n must be non-negative")
+        if n == 0:
+            return b""
+        if n > self.MAX_BYTES_PER_REQUEST:
+            # Spec-conforming chunking.
+            out = bytearray()
+            while n > 0:
+                take = min(n, self.MAX_BYTES_PER_REQUEST)
+                out.extend(self.generate(take, additional if not out else b""))
+                n -= take
+            return bytes(out)
+        if additional:
+            self._update(additional)
+        out = bytearray()
+        while len(out) < n:
+            self.V = self._hmac(self.V)
+            out.extend(self.V)
+        self._update(additional)
+        self.reseed_counter += 1
+        return bytes(out[:n])
+
+
+class HybridDRBG(TRNGSource):
+    """Hybrid TRNG ⊕ HMAC-DRBG entropy source.
+
+    Each output byte is ``DRBG.generate(1) XOR TRNG.read(1)``.  The DRBG
+    is reseeded from the TRNG every ``reseed_interval_bytes`` bytes.
     """
-    HMAC-SHA256-based DRBG mixed with live TRNG bytes.
 
-    Seed: TRNG bytes (>= 64 bytes recommended)
-    Reseed interval: configurable; default 1 MiB of output
-
-    Generate(n):
-        drbg_bytes = HMAC-DRBG(K, V).expand(n)
-        trng_bytes = trng.read(n)
-        return drbg_bytes XOR trng_bytes
-    """
+    name = "hybrid"
 
     def __init__(
         self,
         trng: TRNGSource,
-        reseed_interval: int = 1 << 20,
-        seed_size: int = 64,
-        health: Optional[HealthMonitor] = None,
-    ):
+        seed_bytes: int = 64,
+        reseed_interval_bytes: int = 1 << 20,
+        personalization: bytes = b"kyber_trng.hybrid v1",
+    ) -> None:
         self._trng = trng
-        self._reseed_interval = reseed_interval
-        self._seed_size = seed_size
-        self._health = health or HealthMonitor()
-        self._bytes_since_reseed = 0
-        self._K = b"\x00" * 32
-        self._V = b"\x01" * 32
-        self._reseed()
-
-    def _hmac(self, key: bytes, data: bytes) -> bytes:
-        return hmac.new(key, data, hashlib.sha256).digest()
-
-    def _reseed(self) -> None:
-        seed = self._trng.read(self._seed_size)
-        if not self._health.feed(seed):
-            raise RuntimeError("TRNG failed health tests during reseed")
-        self._K = self._hmac(self._K, self._V + b"\x00" + seed)
-        self._V = self._hmac(self._K, self._V)
-        self._K = self._hmac(self._K, self._V + b"\x01" + seed)
-        self._V = self._hmac(self._K, self._V)
-        self._bytes_since_reseed = 0
-
-    def _drbg_generate(self, n: int) -> bytes:
-        out = bytearray()
-        while len(out) < n:
-            self._V = self._hmac(self._K, self._V)
-            out.extend(self._V)
-        self._K = self._hmac(self._K, self._V + b"\x00")
-        self._V = self._hmac(self._K, self._V)
-        return bytes(out[:n])
+        self._reseed_interval = int(reseed_interval_bytes)
+        self._since_reseed = 0
+        seed = trng.read(seed_bytes)
+        self._drbg = HMAC_DRBG(seed, personalization)
 
     def read(self, n: int) -> bytes:
-        if self._bytes_since_reseed + n > self._reseed_interval:
-            self._reseed()
-        drbg = self._drbg_generate(n)
-        live = self._trng.read(n)
-        if not self._health.feed(live):
-            raise RuntimeError("TRNG failed health tests during generate")
-        self._bytes_since_reseed += n
-        return bytes(a ^ b for a, b in zip(drbg, live))
-
-    def close(self) -> None:
-        self._trng.close()
-
-    @property
-    def health(self) -> HealthMonitor:
-        return self._health
+        if n < 0:
+            raise ValueError("n must be non-negative")
+        if n == 0:
+            return b""
+        out = bytearray(n)
+        produced = 0
+        while produced < n:
+            if self._since_reseed >= self._reseed_interval:
+                self._drbg.reseed(self._trng.read(64))
+                self._since_reseed = 0
+            take = min(n - produced, self._reseed_interval - self._since_reseed,
+                       HMAC_DRBG.MAX_BYTES_PER_REQUEST)
+            drbg_chunk = self._drbg.generate(take)
+            trng_chunk = self._trng.read(take)
+            for i in range(take):
+                out[produced + i] = drbg_chunk[i] ^ trng_chunk[i]
+            produced += take
+            self._since_reseed += take
+        return bytes(out)

@@ -8,15 +8,14 @@ Hardware-entropy-injected ML-KEM (Kyber). Replaces the deterministic
 `AES-CTR_DRBG` / `os.urandom` source inside `kyber-py` with bytes from a
 ring-oscillator True Random Number Generator on a SAM3X8E (Arduino Due),
 backed by NIST SP 800-90B continuous health tests in firmware AND on the host,
-plus a hybrid TRNG ⊕ HMAC-DRBG defense-in-depth mode that the baseline thesis
-design did not provide.
+plus a hybrid TRNG ⊕ HMAC-DRBG defense-in-depth mode.
 
 ---
 
 ## Why this exists
 
-Every Kyber implementation in widespread use today depends on a deterministic
-random number source — `os.urandom`, AES-CTR_DRBG, BoringSSL's `RAND_bytes`,
+The Kyber implementations I surveyed depend on a deterministic random number
+source — `os.urandom`, AES-CTR_DRBG, BoringSSL's `RAND_bytes`,
 etc. These sources are all functions of a single seed at startup. Recover the
 seed and you recover every key the device will ever generate.
 
@@ -32,7 +31,7 @@ Kyber's security model assumes the seeds `d`, `z`, `m` are uniformly random
 and unknown to the attacker. A single recovered seed is enough — the attacker
 does not need to break the lattice problem at all.
 
-This project removes the deterministic dependency entirely.
+This project adds physical entropy, so a recovered software seed is no longer enough.
 
 ## What's here
 
@@ -55,7 +54,7 @@ This project removes the deterministic dependency entirely.
 │   └── kyber_py_entropy_audit.md Full entropy-flow audit of the kyber-py reference
 │
 ├── tests/
-│   └── test_health.py            Pytest suite for health, hybrid, validation
+│   └── test_*.py                 47 tests, including FIPS 203 known-answer replay
 │
 ├── docs/
 │   └── architecture.md           System diagram, trust model, threat model
@@ -82,15 +81,13 @@ pip install -e .
 
 # 3. Use it
 python - <<'EOF'
-from kyber_trng import set_entropy_source, keygen, encaps, decaps, HybridDRBG
-from kyber_trng.source import SerialTRNGSource
+from kyber_trng import set_entropy_source, kyber, HybridDRBG, SerialTRNGSource
 
 set_entropy_source(HybridDRBG(SerialTRNGSource("/dev/ttyACM0")))
 
-pk, sk = keygen()
-ct, ss_a = encaps(pk)
-ss_b = decaps(ct, sk)
-assert ss_a == ss_b
+ek, dk = kyber.l1024.keygen()
+key_a, ct = kyber.l1024.encaps(ek)
+assert kyber.l1024.decaps(dk, ct) == key_a
 print("OK — hardware-rooted Kyber session established")
 EOF
 ```
@@ -100,14 +97,22 @@ EOF
 ```bash
 pip install -e .
 python -c "
-from kyber_trng import set_entropy_source, keygen, encaps, decaps
-from kyber_trng.source import SimulatedTRNGSource
+from kyber_trng import set_entropy_source, kyber, SimulatedTRNGSource
 set_entropy_source(SimulatedTRNGSource())
-pk, sk = keygen(); ct, ss_a = encaps(pk); ss_b = decaps(ct, sk)
-assert ss_a == ss_b
+ek, dk = kyber.l1024.keygen(); key_a, ct = kyber.l1024.encaps(ek)
+assert kyber.l1024.decaps(dk, ct) == key_a
 print('OK')
 "
 ```
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+The suite replays the ML-KEM-1024 FIPS 203 known-answer vectors through the entropy hook.
 
 ## Statistical validation
 
@@ -136,9 +141,9 @@ External tools auto-detected:
 For full coverage, run with NIST SP 800-22 `sts` and `TestU01` separately
 against the captured byte stream.
 
-## Improvements over the baseline thesis design
+## Design improvements
 
-The original thesis (replacing AES-CTR_DRBG with a single ring-oscillator
+My earlier single-source design (replacing AES-CTR_DRBG with a single ring-oscillator
 TRNG) trades one single point of failure for another: if the hardware TRNG
 fails or is compromised, key generation halts or, worse, silently produces
 weak keys. This implementation extends the design with:
@@ -160,13 +165,13 @@ weak keys. This implementation extends the design with:
 
 4. **Auditable entropy log**
    Every Kyber operation records the operation type and bytes consumed.
-   Retrieve with `kyber_trng.audit_log()`.
+   Retrieve with `kyber_trng.audit_log`.
 
 5. **Frame integrity (CRC-8)**
    Each TRNG byte carries a CRC; corrupted frames are dropped silently. No
    silent acceptance of garbage from a flaky USB cable.
 
-## Reproducing the thesis results
+## Running the statistical suites
 
 | Validation suite | How to run |
 |---|---|

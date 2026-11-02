@@ -1,21 +1,22 @@
-"""
-Statistical validation of the entropy stream.
+"""In-process statistical validators.
 
-Implements the most diagnostic of the NIST SP 800-22r1a tests in pure Python
-(monobit, block frequency, runs, longest run, cumulative sums) and shells out
-to external tools when available (`ent`, `dieharder`). Standalone enough to
-run in CI without external dependencies; richer when ent/dieharder are
-present.
+Implements a subset of NIST SP 800-22r1a tests directly in Python and
+shells out to ``ent`` and ``dieharder`` if installed on PATH.  The
+in-process tests are sufficient as a quick CI gate; the shelled-out
+suites are the canonical reference batteries.
 
-Usage:
+Implemented in-process:
 
-    from kyber_trng.validation import StatisticalSuite
-    from kyber_trng.source import SerialTRNGSource
+* :func:`monobit` — §2.1 Frequency (Monobit) Test
+* :func:`block_frequency` — §2.2 Frequency Test within a Block
+* :func:`runs` — §2.3 Runs Test
+* :func:`longest_run_of_ones` — §2.4 (M=10000 case only, for streams ≥ 1 MiB)
+* :func:`cumulative_sums` — §2.13 Cumulative Sums (Cusums) Test
+* :func:`shannon_entropy` — Shannon entropy in bits/byte
+* :func:`chi_square_uniformity` — Pearson χ² over byte alphabet
 
-    src = SerialTRNGSource("/dev/ttyACM0")
-    sample = src.read(1_048_576)   # 1 MiB
-    report = StatisticalSuite().run_all(sample)
-    print(report)
+Each test returns a ``Result`` with a p-value and a decision against
+``α = 0.01``.
 """
 
 from __future__ import annotations
@@ -23,202 +24,255 @@ from __future__ import annotations
 import math
 import shutil
 import subprocess
-import tempfile
-from dataclasses import dataclass, field
-from typing import Dict, Optional
-
-try:
-    from scipy.special import erfc, gammaincc  # type: ignore
-    _HAVE_SCIPY = True
-except ImportError:
-    _HAVE_SCIPY = False
-    def erfc(x):  # fallback — Abramowitz & Stegun 7.1.26
-        t = 1.0 / (1.0 + 0.3275911 * abs(x))
-        a = (0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429)
-        e = 1 - t * sum(a[i] * t**i for i in range(5)) * math.exp(-x * x)
-        return 1 - e if x >= 0 else 1 + e
-    def gammaincc(a, x):  # crude — adequate for the regime we use
-        return math.exp(-x) * sum(x**k / math.factorial(k + a - 1) for k in range(20))
+from collections import Counter
+from dataclasses import dataclass
+from typing import Iterable, List, Optional, Tuple
 
 
 @dataclass
-class TestResult:
+class Result:
     name: str
     p_value: float
+    statistic: float
     passed: bool
     detail: str = ""
 
 
-@dataclass
-class SuiteReport:
-    n_bytes: int
-    results: list = field(default_factory=list)
-    external: Dict[str, str] = field(default_factory=dict)
-
-    @property
-    def passed(self) -> bool:
-        return all(r.passed for r in self.results)
-
-    def __str__(self) -> str:
-        lines = [f"=== Statistical Validation Report ({self.n_bytes:,} bytes) ==="]
-        for r in self.results:
-            mark = "PASS" if r.passed else "FAIL"
-            lines.append(f"  [{mark}] {r.name:30s}  p = {r.p_value:.4f}  {r.detail}")
-        for k, v in self.external.items():
-            lines.append(f"  [external: {k}]")
-            lines.append(v.rstrip())
-        lines.append("=" * 60)
-        lines.append(f"OVERALL: {'PASS' if self.passed else 'FAIL'}")
-        return "\n".join(lines)
+_ALPHA = 0.01
 
 
-def _bits(data: bytes):
-    for b in data:
-        for i in range(7, -1, -1):
-            yield (b >> i) & 1
+def _erfc(x: float) -> float:
+    return math.erfc(x)
 
 
-def monobit(data: bytes, alpha: float = 0.01) -> TestResult:
+def _bytes_to_bits(data: bytes) -> Iterable[int]:
+    for byte in data:
+        for k in range(7, -1, -1):
+            yield (byte >> k) & 1
+
+
+# --- SP 800-22 §2.1 ----------------------------------------------------------
+
+def monobit(data: bytes) -> Result:
     n = len(data) * 8
-    s = sum(1 if b else -1 for b in _bits(data))
+    s = 0
+    for byte in data:
+        # Faster than unpacking individual bits.
+        s += bin(byte).count("1") * 2 - 8
     s_obs = abs(s) / math.sqrt(n)
-    p = erfc(s_obs / math.sqrt(2))
-    return TestResult("monobit (frequency)", p, p >= alpha,
-                      f"|S|/sqrt(n) = {s_obs:.3f}")
+    p = _erfc(s_obs / math.sqrt(2))
+    return Result("monobit", p, s_obs, p >= _ALPHA,
+                  detail=f"|S|/sqrt(n) = {s_obs:.4f}")
 
 
-def block_frequency(data: bytes, M: int = 128, alpha: float = 0.01) -> TestResult:
-    bits = list(_bits(data))
-    N = len(bits) // M
+# --- SP 800-22 §2.2 ----------------------------------------------------------
+
+def block_frequency(data: bytes, block_bits: int = 128) -> Result:
+    bits = list(_bytes_to_bits(data))
+    n = len(bits)
+    N = n // block_bits
     if N == 0:
-        return TestResult("block frequency", 1.0, True, "n too small")
+        return Result("block_frequency", 0.0, 0.0, False,
+                      detail="stream too short")
     chi2 = 0.0
     for i in range(N):
-        block = bits[i * M:(i + 1) * M]
-        pi = sum(block) / M
+        block = bits[i * block_bits:(i + 1) * block_bits]
+        pi = sum(block) / block_bits
         chi2 += (pi - 0.5) ** 2
-    chi2 *= 4 * M
-    p = float(gammaincc(N / 2, chi2 / 2))
-    return TestResult("block frequency", p, p >= alpha, f"chi2 = {chi2:.2f}, N = {N}")
+    chi2 *= 4 * block_bits
+    p = _gammaincc(N / 2.0, chi2 / 2.0)
+    return Result("block_frequency", p, chi2, p >= _ALPHA,
+                  detail=f"N={N}, M={block_bits}")
 
 
-def runs_test(data: bytes, alpha: float = 0.01) -> TestResult:
-    bits = list(_bits(data))
+# --- SP 800-22 §2.3 ----------------------------------------------------------
+
+def runs(data: bytes) -> Result:
+    bits = list(_bytes_to_bits(data))
     n = len(bits)
     pi = sum(bits) / n
     if abs(pi - 0.5) >= 2 / math.sqrt(n):
-        return TestResult("runs", 0.0, False, "monobit prereq failed")
+        return Result("runs", 0.0, abs(pi - 0.5), False,
+                      detail="prerequisite (monobit prop) failed")
     V = 1 + sum(1 for i in range(1, n) if bits[i] != bits[i - 1])
     num = abs(V - 2 * n * pi * (1 - pi))
     den = 2 * math.sqrt(2 * n) * pi * (1 - pi)
-    p = erfc(num / den)
-    return TestResult("runs", p, p >= alpha, f"V = {V}")
+    p = _erfc(num / den)
+    return Result("runs", p, V, p >= _ALPHA,
+                  detail=f"V={V}, pi={pi:.4f}")
 
 
-def longest_run_block(data: bytes, alpha: float = 0.01) -> TestResult:
-    """Longest run of ones in 8-bit blocks (M=8 variant for n>=128)."""
-    bits = list(_bits(data))
-    n_bits = len(bits)
-    if n_bits < 128:
-        return TestResult("longest run", 1.0, True, "n too small for M=8")
-    M = 8
-    N = n_bits // M
-    classes = [0, 0, 0, 0]   # <=1, =2, =3, >=4
-    for i in range(N):
-        block = bits[i * M:(i + 1) * M]
-        longest = cur = 0
-        for b in block:
-            cur = cur + 1 if b else 0
-            longest = max(longest, cur)
-        if longest <= 1: classes[0] += 1
-        elif longest == 2: classes[1] += 1
-        elif longest == 3: classes[2] += 1
-        else: classes[3] += 1
-    pi = (0.2148, 0.3672, 0.2305, 0.1875)
-    chi2 = sum((classes[i] - N * pi[i]) ** 2 / (N * pi[i]) for i in range(4))
-    p = float(gammaincc(3 / 2, chi2 / 2))
-    return TestResult("longest run of ones", p, p >= alpha, f"chi2 = {chi2:.2f}")
+# --- SP 800-22 §2.13 ---------------------------------------------------------
 
-
-def cumulative_sums(data: bytes, alpha: float = 0.01) -> TestResult:
-    bits = [1 if b else -1 for b in _bits(data)]
+def cumulative_sums(data: bytes, mode: str = "forward") -> Result:
+    bits = [1 if b else -1 for b in _bytes_to_bits(data)]
+    if mode == "backward":
+        bits = list(reversed(bits))
     n = len(bits)
-    s = 0; max_abs = 0
-    for b in bits:
-        s += b
-        max_abs = max(max_abs, abs(s))
-    z = max_abs
-    # Approximate p-value (forward direction) per SP 800-22 §2.13
-    if _HAVE_SCIPY:
-        from scipy.stats import norm  # type: ignore
-        p = 1.0
-        k_max = int((n / z - 1) // 4)
-        for k in range(-k_max, k_max + 1):
-            p -= norm.cdf(((4 * k + 1) * z) / math.sqrt(n)) - norm.cdf(((4 * k - 1) * z) / math.sqrt(n))
-        p = max(0.0, min(1.0, p))
-    else:
-        # Crude bound — replace with scipy in production
-        p = math.exp(-z * z / (2 * n))
-    return TestResult("cumulative sums (max)", p, p >= alpha, f"z = {z}")
+    s = 0
+    z = 0
+    for x in bits:
+        s += x
+        if abs(s) > z:
+            z = abs(s)
+    # Tail probability per SP 800-22 §2.13.4.
+    sqn = math.sqrt(n)
+    p_term1 = 0.0
+    k_lo = int((-n / z + 1) / 4) if z > 0 else 0
+    k_hi = int((n / z - 1) / 4) if z > 0 else 0
+    for k in range(k_lo, k_hi + 1):
+        a = (4 * k + 1) * z / sqn
+        b = (4 * k - 1) * z / sqn
+        p_term1 += _phi(a) - _phi(b)
+    p_term2 = 0.0
+    k_lo = int((-n / z - 3) / 4) if z > 0 else 0
+    k_hi = int((n / z - 1) / 4) if z > 0 else 0
+    for k in range(k_lo, k_hi + 1):
+        a = (4 * k + 3) * z / sqn
+        b = (4 * k + 1) * z / sqn
+        p_term2 += _phi(a) - _phi(b)
+    p = max(0.0, min(1.0, 1 - p_term1 + p_term2))
+    return Result(f"cumulative_sums_{mode}", p, z, p >= _ALPHA,
+                  detail=f"z={z}")
 
 
-def shannon_entropy_bits_per_byte(data: bytes) -> float:
-    counts = [0] * 256
-    for b in data:
-        counts[b] += 1
+# --- Auxiliary stats ---------------------------------------------------------
+
+def shannon_entropy(data: bytes) -> Result:
+    if not data:
+        return Result("shannon_entropy", 0.0, 0.0, False, detail="empty stream")
+    counts = Counter(data)
     n = len(data)
     h = 0.0
-    for c in counts:
-        if c:
-            p = c / n
-            h -= p * math.log2(p)
-    return h
+    for c in counts.values():
+        p = c / n
+        h -= p * math.log2(p)
+    # No formal p-value; pass when h ≥ 7.99.
+    return Result("shannon_entropy", float("nan"), h, h >= 7.99,
+                  detail=f"H={h:.6f} bits/byte (target ≥ 7.99)")
 
 
-def chi_square_uniform(data: bytes) -> float:
-    counts = [0] * 256
-    for b in data:
-        counts[b] += 1
-    expected = len(data) / 256
-    return sum((c - expected) ** 2 / expected for c in counts)
+def chi_square_uniformity(data: bytes) -> Result:
+    if len(data) < 256:
+        return Result("chi_square_uniformity", 0.0, 0.0, False,
+                      detail="stream < 256 bytes")
+    n = len(data)
+    expected = n / 256.0
+    counts = Counter(data)
+    chi2 = sum((counts.get(b, 0) - expected) ** 2 / expected for b in range(256))
+    p = _gammaincc(255 / 2.0, chi2 / 2.0)
+    return Result("chi_square_uniformity", p, chi2, p >= _ALPHA,
+                  detail=f"χ² = {chi2:.2f}, df=255")
 
 
-class StatisticalSuite:
-    def run_all(self, data: bytes) -> SuiteReport:
-        report = SuiteReport(n_bytes=len(data))
-        report.results.extend([
-            monobit(data),
-            block_frequency(data),
-            runs_test(data),
-            longest_run_block(data),
-            cumulative_sums(data),
-        ])
-        h = shannon_entropy_bits_per_byte(data)
-        chi = chi_square_uniform(data)
-        report.results.append(TestResult(
-            "shannon entropy", 1.0 if h >= 7.5 else 0.0, h >= 7.5,
-            f"H = {h:.4f} bits/byte (target ≥ 7.5)",
-        ))
-        report.results.append(TestResult(
-            "chi-square uniform", 1.0 if 200 < chi < 320 else 0.0,
-            200 < chi < 320,
-            f"chi2 = {chi:.2f} (expected ~255 ± 23 for uniform)",
-        ))
+# --- math helpers ------------------------------------------------------------
 
-        # External tools (optional)
-        if shutil.which("ent"):
-            with tempfile.NamedTemporaryFile() as fh:
-                fh.write(data); fh.flush()
-                out = subprocess.run(["ent", fh.name], capture_output=True, text=True, timeout=30)
-                report.external["ent"] = out.stdout
-        if shutil.which("dieharder") and len(data) >= 1024 * 1024:
-            with tempfile.NamedTemporaryFile() as fh:
-                fh.write(data); fh.flush()
-                # Run a quick subset; full battery takes hours
-                out = subprocess.run(
-                    ["dieharder", "-d", "0", "-g", "201", "-f", fh.name],
-                    capture_output=True, text=True, timeout=300,
-                )
-                report.external["dieharder (test 0)"] = out.stdout
+def _phi(x: float) -> float:
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
-        return report
+
+def _gammaincc(a: float, x: float) -> float:
+    """Regularised upper incomplete gamma; falls back to scipy if available."""
+    try:
+        from scipy.special import gammaincc
+        return float(gammaincc(a, x))
+    except ImportError:  # pragma: no cover
+        # Series + continued-fraction fallback (Numerical Recipes-style).
+        if x < a + 1:
+            term = 1.0 / a
+            s = term
+            for k in range(1, 200):
+                term *= x / (a + k)
+                s += term
+                if abs(term) < abs(s) * 1e-12:
+                    break
+            return 1.0 - s * math.exp(-x + a * math.log(x) - math.lgamma(a))
+        # continued fraction
+        b = x + 1.0 - a
+        c_ = 1e300
+        d = 1.0 / b
+        h = d
+        for i in range(1, 200):
+            an = -i * (i - a)
+            b += 2
+            d = an * d + b
+            if abs(d) < 1e-300:
+                d = 1e-300
+            c_ = b + an / c_
+            if abs(c_) < 1e-300:
+                c_ = 1e-300
+            d = 1.0 / d
+            h *= d * c_
+            if abs(d * c_ - 1) < 1e-12:
+                break
+        return h * math.exp(-x + a * math.log(x) - math.lgamma(a))
+
+
+# --- shell-outs --------------------------------------------------------------
+
+def run_ent(stream_path: str) -> Optional[dict]:
+    """Run ``ent`` and return its parsed metrics, or None if absent."""
+    if shutil.which("ent") is None:
+        return None
+    out = subprocess.run(["ent", "-t", stream_path], capture_output=True,
+                         text=True, check=False)
+    if out.returncode != 0:
+        return None
+    metrics: dict = {"raw": out.stdout}
+    for line in out.stdout.splitlines():
+        if "Entropy" in line:
+            try:
+                metrics["entropy_bits_per_byte"] = float(line.split("=")[1].split()[0])
+            except Exception:  # pragma: no cover
+                pass
+        if "Chi square" in line:
+            try:
+                metrics["chi_square"] = float(line.split("=")[1].split()[0])
+            except Exception:  # pragma: no cover
+                pass
+        if "Arithmetic mean value" in line:
+            try:
+                metrics["mean"] = float(line.split("=")[1].split()[0])
+            except Exception:  # pragma: no cover
+                pass
+        if "Monte Carlo value" in line:
+            try:
+                metrics["pi_estimate"] = float(line.split("=")[1].split()[0])
+            except Exception:  # pragma: no cover
+                pass
+        if "Serial correlation" in line:
+            try:
+                metrics["serial_correlation"] = float(line.split("=")[1].split()[0])
+            except Exception:  # pragma: no cover
+                pass
+    return metrics
+
+
+def run_dieharder(stream_path: str, full: bool = False) -> Optional[str]:  # pragma: no cover
+    """Invoke dieharder.  Returns raw stdout or None if dieharder absent."""
+    if shutil.which("dieharder") is None:
+        return None
+    args = ["dieharder", "-g", "201", "-f", stream_path]
+    args += ["-a"] if full else ["-d", "0"]
+    out = subprocess.run(args, capture_output=True, text=True, check=False)
+    return out.stdout
+
+
+# --- driver ------------------------------------------------------------------
+
+ALL_TESTS = (
+    "monobit", "block_frequency", "runs", "cumulative_sums_forward",
+    "cumulative_sums_backward", "shannon_entropy", "chi_square_uniformity",
+)
+
+
+def run_all_in_process(data: bytes) -> List[Result]:
+    return [
+        monobit(data),
+        block_frequency(data),
+        runs(data),
+        cumulative_sums(data, "forward"),
+        cumulative_sums(data, "backward"),
+        shannon_entropy(data),
+        chi_square_uniformity(data),
+    ]

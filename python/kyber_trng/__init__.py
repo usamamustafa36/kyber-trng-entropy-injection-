@@ -1,38 +1,32 @@
+"""kyber_trng — entropy injection framework for ML-KEM.
+
+This package separates the entropy *source* from the lattice-cryptographic
+operations of ML-KEM.  Sources implement a uniform :class:`TRNGSource`
+interface and may be:
+
+* a hardware ring-oscillator TRNG accessed via USB CDC (production);
+* a software simulator that mixes OS entropy with timing-jitter samples
+  (development, CI, and the validation runs reported in this repository);
+* a hybrid mode that XORs live source bytes with HMAC-DRBG output.
+
+The package also implements the SP 800-90B RCT and APT continuous health
+tests, an audit log, and a thin shim that wires the active source into
+``kyber-py``'s ``ML_KEM`` instances by overriding their ``random_bytes``
+attribute.
 """
-kyber_trng — Hardware-entropy-injected Kyber (ML-KEM) wrapper.
 
-Replaces the deterministic AES-CTR_DRBG / os.urandom entropy source inside
-kyber-py with bytes pulled from a hardware TRNG (SAM3X8E ring-oscillator
-firmware) — eliminating the deterministic single point of failure that affects
-every standard Kyber deployment.
-
-Improvement over the baseline thesis design:
-  * Hybrid TRNG ⊕ DRBG mode (defense in depth)
-  * NIST SP 800-90B continuous health tests on the host side as well as in firmware
-  * Per-byte min-entropy estimation
-  * Auditable byte-source log
-
-Author: Usama Mustafa
-License: MIT
-"""
-
-from .source import TRNGSource, SimulatedTRNGSource, SerialTRNGSource
-from .hybrid import HybridDRBG
-from .health import RepetitionCountTest, AdaptiveProportionTest, HealthMonitor
-from .kyber_shim import keygen, encaps, decaps, set_entropy_source
+from .source import (TRNGSource, SimulatedTRNGSource, SerialTRNGSource,
+                     ConditionedSource, TRNGSourceError)
+from .health import HealthMonitor, HealthReport, RepetitionCountTest, AdaptiveProportionTest
+from .hybrid import HybridDRBG, HMAC_DRBG
+from .kyber_shim import set_entropy_source, kyber, kat_mode, audit_log
 
 __all__ = [
-    "TRNGSource",
-    "SimulatedTRNGSource",
-    "SerialTRNGSource",
-    "HybridDRBG",
-    "RepetitionCountTest",
-    "AdaptiveProportionTest",
-    "HealthMonitor",
-    "keygen",
-    "encaps",
-    "decaps",
-    "set_entropy_source",
+    "TRNGSource", "SimulatedTRNGSource", "SerialTRNGSource",
+    "ConditionedSource", "TRNGSourceError",
+    "HealthMonitor", "HealthReport", "RepetitionCountTest", "AdaptiveProportionTest",
+    "HybridDRBG", "HMAC_DRBG",
+    "set_entropy_source", "kyber", "kat_mode", "audit_log",
 ]
 
 __version__ = "0.1.0"

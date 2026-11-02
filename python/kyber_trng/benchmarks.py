@@ -1,109 +1,112 @@
-"""
-Performance comparison: stock kyber-py (os.urandom) vs TRNG-injected variants.
-
-Measures:
-  * Key generation latency
-  * Encapsulation latency
-  * Decapsulation latency (sanity — entropy-independent)
-  * Effective throughput of the entropy source
-
-Run:
-    python -m kyber_trng.benchmarks
-"""
+"""Latency and throughput benchmarks for ML-KEM under different sources."""
 
 from __future__ import annotations
 
-import argparse
+import math
+import os
 import statistics
 import time
-from contextlib import contextmanager
-from typing import Callable, List, Tuple
+from dataclasses import dataclass
+from typing import Callable, List, Optional
 
-from .source import SimulatedTRNGSource, TRNGSource
+from .source import TRNGSource, SimulatedTRNGSource
 from .hybrid import HybridDRBG
-from .kyber_shim import set_entropy_source, keygen, encaps, decaps
+from .kyber_shim import kyber, set_entropy_source, get_entropy_source
 
 
-@contextmanager
-def timer():
-    t = [time.perf_counter()]
-    yield t
-    t.append(time.perf_counter())
+@dataclass
+class LatencyStats:
+    label: str
+    op: str
+    n: int
+    mean_ms: float
+    median_ms: float
+    stdev_ms: float
+    ci95_ms: float
+    min_ms: float
+    max_ms: float
 
 
-def time_call(fn: Callable, runs: int) -> Tuple[float, float, float]:
-    samples: List[float] = []
-    for _ in range(runs):
+def _t95(n: int) -> float:
+    """Crude 95% t-multiplier; good enough for n in [10, 1000]."""
+    if n <= 1:
+        return float("nan")
+    table = {2: 12.71, 5: 2.78, 10: 2.26, 20: 2.09, 30: 2.04, 50: 2.01, 100: 1.98}
+    keys = sorted(table)
+    for k in keys:
+        if n <= k:
+            return table[k]
+    return 1.96
+
+
+def measure(label: str, op: str, fn: Callable[[], None], n: int) -> LatencyStats:
+    samples = []
+    # one warm-up
+    fn()
+    for _ in range(n):
         t0 = time.perf_counter()
         fn()
-        samples.append(time.perf_counter() - t0)
-    return (statistics.mean(samples) * 1e3,
-            statistics.median(samples) * 1e3,
-            statistics.stdev(samples) * 1e3 if len(samples) > 1 else 0.0)
+        samples.append((time.perf_counter() - t0) * 1000.0)
+    mean = statistics.mean(samples)
+    median = statistics.median(samples)
+    stdev = statistics.stdev(samples) if len(samples) > 1 else 0.0
+    ci = _t95(n) * stdev / math.sqrt(n) if n > 1 else 0.0
+    return LatencyStats(label, op, n, mean, median, stdev, ci,
+                        min(samples), max(samples))
 
 
-def benchmark(label: str, runs: int = 20) -> None:
-    pk_holder = [None]; sk_holder = [None]; ct_holder = [None]; ss_holder = [None]
+# --- Drivers ---------------------------------------------------------------
 
-    def kg():
-        pk, sk = keygen(); pk_holder[0], sk_holder[0] = pk, sk
-
-    def en():
-        ct, ss = encaps(pk_holder[0]); ct_holder[0], ss_holder[0] = ct, ss
-
-    def de():
-        decaps(ct_holder[0], sk_holder[0])
-
-    print(f"\n--- {label} ({runs} runs each) ---")
-    kg()  # warmup
-    print(f"  keygen   : mean={time_call(kg, runs)[0]:7.2f} ms  median={time_call(kg, runs)[1]:7.2f} ms")
-    en()
-    print(f"  encaps   : mean={time_call(en, runs)[0]:7.2f} ms  median={time_call(en, runs)[1]:7.2f} ms")
-    de()
-    print(f"  decaps   : mean={time_call(de, runs)[0]:7.2f} ms  median={time_call(de, runs)[1]:7.2f} ms")
+class _OSUrandomSource(TRNGSource):
+    name = "os_urandom"
+    def read(self, n: int) -> bytes:
+        return os.urandom(n)
 
 
-def entropy_throughput(src: TRNGSource, label: str, total: int = 1 << 16) -> None:
-    t0 = time.perf_counter()
-    src.read(total)
-    dt = time.perf_counter() - t0
-    print(f"  {label:20s}  {total:>8} B in {dt*1000:7.2f} ms  "
-          f"=  {total / dt / 1024:8.1f} KiB/s")
+def benchmark_all(n_runs: int = 100, level: int = 1024) -> List[LatencyStats]:
+    """Benchmark KeyGen, Encaps, Decaps under three entropy sources.
+
+    Returns 9 :class:`LatencyStats` records.  Decaps does not consume
+    fresh entropy, but is included to confirm the source-switch overhead
+    is bounded.
+    """
+    facade = getattr(kyber, f"l{level}")
+    sources = [
+        ("os_urandom", _OSUrandomSource()),
+        ("simulated_trng", SimulatedTRNGSource()),
+        ("hybrid_trng_drbg", HybridDRBG(SimulatedTRNGSource())),
+    ]
+    saved = get_entropy_source()
+    results: List[LatencyStats] = []
+    try:
+        for label, src in sources:
+            set_entropy_source(src)
+            # Pre-generate a key for encaps/decaps so the cost is isolated.
+            ek, dk = facade.keygen()
+            _, ct = facade.encaps(ek)
+
+            results.append(measure(label, "keygen",
+                                   lambda f=facade: f.keygen(), n_runs))
+            results.append(measure(label, "encaps",
+                                   lambda f=facade, k=ek: f.encaps(k), n_runs))
+            results.append(measure(label, "decaps",
+                                   lambda f=facade, d=dk, c=ct: f.decaps(d, c), n_runs))
+    finally:
+        set_entropy_source(saved)
+    return results
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", help="serial port for hardware TRNG (e.g. /dev/ttyACM0)")
-    parser.add_argument("--runs", type=int, default=20)
-    args = parser.parse_args()
-
-    print("=" * 60)
-    print("kyber-trng-entropy-injection :: benchmark suite")
-    print("=" * 60)
-
-    print("\nEntropy throughput")
-    sim = SimulatedTRNGSource()
-    entropy_throughput(sim, "simulated", 1 << 16)
-
-    if args.port:
-        from .source import SerialTRNGSource
-        ser = SerialTRNGSource(args.port)
-        entropy_throughput(ser, "serial-TRNG", 1 << 14)
-        ser.close()
-
-    # Variant 1: simulated TRNG only (replaces os.urandom)
-    set_entropy_source(SimulatedTRNGSource())
-    benchmark("Simulated TRNG (drop-in)", args.runs)
-
-    # Variant 2: hybrid DRBG (TRNG XOR HMAC-DRBG) — recommended
-    set_entropy_source(HybridDRBG(SimulatedTRNGSource()))
-    benchmark("Hybrid TRNG ⊕ HMAC-DRBG", args.runs)
-
-    if args.port:
-        from .source import SerialTRNGSource
-        set_entropy_source(SerialTRNGSource(args.port))
-        benchmark("Hardware TRNG (SAM3X8E)", args.runs)
-
-
-if __name__ == "__main__":
-    main()
+def format_latency_table(rows: List[LatencyStats]) -> str:
+    """Pretty-print a list of LatencyStats as a fixed-width table."""
+    headers = ["source", "op", "n", "mean(ms)", "±95%CI", "median", "stdev", "min", "max"]
+    fmt_row = "{:<18}{:<10}{:>5}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}"
+    lines = [fmt_row.format(*headers)]
+    lines.append("-" * len(lines[0]))
+    for r in rows:
+        lines.append(fmt_row.format(
+            r.label, r.op, r.n,
+            f"{r.mean_ms:.3f}", f"{r.ci95_ms:.3f}",
+            f"{r.median_ms:.3f}", f"{r.stdev_ms:.3f}",
+            f"{r.min_ms:.3f}", f"{r.max_ms:.3f}",
+        ))
+    return "\n".join(lines)

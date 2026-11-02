@@ -1,121 +1,156 @@
-"""
-Kyber (ML-KEM) wrapper that injects TRNG entropy in place of os.urandom.
+"""Integration shim between :mod:`kyber_trng` and ``kyber-py``.
 
-Compatible with the kyber-py library by Giacomo Pope (github.com/GiacomoPope/kyber-py).
-The shim transparently patches os.urandom for the duration of each Kyber call,
-sourcing bytes from the configured TRNGSource / HybridDRBG instead.
+``kyber-py``'s ``ML_KEM`` instances expose a ``random_bytes`` attribute
+(default ``os.urandom``).  We replace that attribute on each call,
+counting the bytes the call actually consumed via a small wrapper.
 
-Usage:
-
-    from kyber_trng import set_entropy_source, keygen, encaps, decaps
-    from kyber_trng.source import SerialTRNGSource
-
-    set_entropy_source(SerialTRNGSource("/dev/ttyACM0"))
-
-    pk, sk = keygen()
-    ct, ss_a = encaps(pk)
-    ss_b = decaps(ct, sk)
-    assert ss_a == ss_b
+This is cleaner than the scoped ``os.urandom`` patch the original
+specification described — it touches one well-documented public
+attribute instead of monkey-patching a builtin.
 """
 
 from __future__ import annotations
 
 import os
 import threading
+import warnings
 from contextlib import contextmanager
-from typing import Optional, Tuple, Union
+from typing import Iterator, Optional, Tuple
 
+from .audit import AuditLog
 from .source import TRNGSource
-from .hybrid import HybridDRBG
-
-_lock = threading.Lock()
-_active_source: Optional[Union[TRNGSource, HybridDRBG]] = None
-_audit_log: list = []
-_audit_max = 1024
 
 
-def set_entropy_source(source: Union[TRNGSource, HybridDRBG]) -> None:
-    """Install the entropy source used by all subsequent Kyber operations."""
-    global _active_source
+_lock = threading.RLock()
+_active: Optional[TRNGSource] = None
+audit_log = AuditLog()
+
+
+def set_entropy_source(source: Optional[TRNGSource]) -> None:
+    """Install ``source`` as the active entropy source.  ``None`` clears."""
+    global _active
     with _lock:
-        _active_source = source
+        _active = source
 
 
-def get_entropy_source() -> Optional[Union[TRNGSource, HybridDRBG]]:
-    return _active_source
+def get_entropy_source() -> Optional[TRNGSource]:
+    return _active
 
 
-def audit_log() -> list:
-    """Recent (operation, n_bytes_consumed) tuples — for analysis & traceability."""
-    return list(_audit_log)
+def _ml_kem_class(level: int):
+    if level == 512:
+        from kyber_py.ml_kem import ML_KEM_512 as cls
+    elif level == 768:
+        from kyber_py.ml_kem import ML_KEM_768 as cls
+    elif level == 1024:
+        from kyber_py.ml_kem import ML_KEM_1024 as cls
+    else:
+        raise ValueError(f"unknown ML-KEM level {level!r}; expected 512/768/1024")
+    return cls
 
 
 @contextmanager
-def _patched_urandom(label: str):
-    """
-    Monkey-patch os.urandom for the duration of a Kyber call.
+def _bound_random_bytes(instance, source: TRNGSource, label: str) -> Iterator[None]:
+    """Temporarily hook ``instance.random_bytes`` to ``source.read``.
 
-    kyber-py and most reference implementations call os.urandom internally
-    for keygen seeds (d, z) and encaps coins (m). Patching scoped to the
-    call avoids global side effects.
+    Records (operation, bytes_consumed) into the audit log on exit.
     """
-    if _active_source is None:
-        raise RuntimeError(
-            "No entropy source configured — call set_entropy_source() first."
-        )
-
-    original = os.urandom
-    consumed = [0]
+    original = instance.random_bytes
+    counter = [0]
 
     def _patched(n: int) -> bytes:
-        consumed[0] += n
-        return _active_source.read(n)
+        counter[0] += n
+        return source.read(n)
 
-    os.urandom = _patched  # type: ignore[assignment]
+    instance.random_bytes = _patched
     try:
         yield
     finally:
-        os.urandom = original
-        if len(_audit_log) >= _audit_max:
-            _audit_log.pop(0)
-        _audit_log.append((label, consumed[0]))
+        instance.random_bytes = original
+        audit_log.record(label, source.name, counter[0])
 
 
-def _import_kyber():
-    """Import the upstream kyber-py library lazily so the package can be installed
-    without it (e.g., for firmware-only or test-only workflows)."""
-    try:
-        from kyber_py.ml_kem import ML_KEM_1024  # type: ignore
-        return ML_KEM_1024
-    except ImportError as exc:
-        raise ImportError(
-            "kyber-py not installed. Install with: pip install kyber-py"
-        ) from exc
+class _KyberFacade:
+    """Thin facade over ``kyber-py``'s ``ML_KEM`` classes.
 
-
-def keygen() -> Tuple[bytes, bytes]:
-    """ML-KEM-1024 key generation with TRNG-sourced entropy."""
-    ml_kem = _import_kyber()
-    with _patched_urandom("keygen"):
-        ek, dk = ml_kem.keygen()
-    return ek, dk
-
-
-def encaps(public_key: bytes) -> Tuple[bytes, bytes]:
-    """ML-KEM-1024 encapsulation. Returns (ciphertext, shared_secret)."""
-    ml_kem = _import_kyber()
-    with _patched_urandom("encaps"):
-        ss, ct = ml_kem.encaps(public_key)
-    return ct, ss
-
-
-def decaps(ciphertext: bytes, secret_key: bytes) -> bytes:
-    """ML-KEM-1024 decapsulation. Returns shared_secret.
-
-    Decaps is deterministic — no entropy consumed — but we still log the call
-    for completeness of the audit trail.
+    Supports ``keygen()``, ``encaps(ek)``, and ``decaps(dk, ct)`` for
+    levels 512, 768, and 1024.  Use ``kyber.l1024`` / ``.l768`` / ``.l512``
+    for the convenience accessors.
     """
-    ml_kem = _import_kyber()
-    with _patched_urandom("decaps"):
-        ss = ml_kem.decaps(secret_key, ciphertext)
-    return ss
+
+    def __init__(self, level: int):
+        self._level = level
+        self._cls = _ml_kem_class(level)
+
+    @property
+    def level(self) -> int:
+        return self._level
+
+    def _require_source(self) -> TRNGSource:
+        with _lock:
+            if _active is None:
+                raise RuntimeError(
+                    "kyber_trng: no entropy source installed.  Call "
+                    "set_entropy_source(SimulatedTRNGSource()) (or another "
+                    "TRNGSource) before invoking keygen/encaps."
+                )
+            return _active
+
+    def keygen(self) -> Tuple[bytes, bytes]:
+        src = self._require_source()
+        with _bound_random_bytes(self._cls, src, f"ml_kem_{self._level}.keygen"):
+            return self._cls.keygen()
+
+    def encaps(self, ek: bytes) -> Tuple[bytes, bytes]:
+        src = self._require_source()
+        with _bound_random_bytes(self._cls, src, f"ml_kem_{self._level}.encaps"):
+            return self._cls.encaps(ek)
+
+    def decaps(self, dk: bytes, ct: bytes) -> bytes:
+        # decaps does not consume fresh entropy in ML-KEM, but we still
+        # patch defensively in case of upstream changes.
+        src = self._require_source()
+        with _bound_random_bytes(self._cls, src, f"ml_kem_{self._level}.decaps"):
+            return self._cls.decaps(dk, ct)
+
+
+class _Kyber:
+    """Namespace giving ``kyber.l1024.keygen()`` etc."""
+
+    def __init__(self) -> None:
+        self.l512 = _KyberFacade(512)
+        self.l768 = _KyberFacade(768)
+        self.l1024 = _KyberFacade(1024)
+
+
+kyber = _Kyber()
+
+
+@contextmanager
+def kat_mode(seed: bytes) -> Iterator[None]:
+    """Temporarily disable the TRNG and seed AES-CTR_DRBG from ``seed``.
+
+    Use this only for KAT replay against published NIST vectors.
+    Emits a ``UserWarning`` on entry — KAT mode is *not* a production
+    operating mode.
+    """
+    if len(seed) < 48:
+        raise ValueError("KAT seed must be ≥ 48 bytes (NIST KAT format)")
+    warnings.warn(
+        "kyber_trng.kat_mode active: TRNG bypassed for KAT replay.",
+        UserWarning,
+        stacklevel=2,
+    )
+    saved = get_entropy_source()
+    set_entropy_source(None)
+    # Seed each level.
+    classes = [_ml_kem_class(l) for l in (512, 768, 1024)]
+    saved_random = [c.random_bytes for c in classes]
+    for c in classes:
+        c.set_drbg_seed(seed)
+    try:
+        yield
+    finally:
+        for c, r in zip(classes, saved_random):
+            c.random_bytes = r
+        set_entropy_source(saved)
